@@ -16,6 +16,8 @@ from ultralytics.utils.torch_utils import autocast
 from .metrics import bbox_iou, probiou
 from .tal import bbox2dist
 
+from .metrics import bbox_iou, probiou,bbox_SCIoU
+
 
 class VarifocalLoss(nn.Module):
     """Varifocal loss by Zhang et al.
@@ -125,7 +127,8 @@ class BboxLoss(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute IoU and DFL losses for bounding boxes."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
-        iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
+        # iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
+        iou = bbox_SCIoU(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, SCIoU=True, gamma=1.0) #CIoU改动260104
         loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
 
         # DFL loss
