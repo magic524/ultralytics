@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 
 from ultralytics.nn.autobackend import check_class_names
-from ultralytics.nn.attention.terrasegnet import SSAM,CAAM
+from ultralytics.nn.attention.terrasegnet import SSAM,CAAM,CAAMv2
 from ultralytics.nn.modules import (
     AIFI,
     C1,
@@ -1554,7 +1554,7 @@ def parse_model(d, ch, verbose=True):
             SCDown,
             C2fCIB,
             A2C2f,
-            SSAM,CAAM
+            SSAM,CAAM,CAAMv2,
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments
