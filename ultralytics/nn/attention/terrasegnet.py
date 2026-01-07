@@ -144,6 +144,90 @@ class CAAM(nn.Module):
         out = out * context
  
         return identity + out
+
+
+class CAAMv2(nn.Module):
+    '''Improved Convolutional Axial Attention Module (CAAM v2)'''
+    def __init__(self, dim, squeeze_factor=4, dropout=0.1):
+        super(CAAMv2, self).__init__()
+        self.squeeze_factor = squeeze_factor
+        squeezed_dim = max(1, dim // squeeze_factor)
+        
+        # ✅ 改进1: Squeeze projections with activation
+        self.squeeze_proj = nn.Sequential(
+            nn.Conv2d(dim, squeezed_dim, 1, bias=False),
+            nn.BatchNorm2d(squeezed_dim),
+            nn.SiLU(inplace=True)  # 添加激活函数
+        )
+        
+        # Axial attention components
+        self.h_avg_pool = nn.AdaptiveAvgPool2d((None, 1))
+        self.w_avg_pool = nn.AdaptiveAvgPool2d((1, None))
+        self.h_max_pool = nn.AdaptiveMaxPool2d((None, 1))
+        self.w_max_pool = nn.AdaptiveMaxPool2d((1, None))
+        
+        # ✅ 改进2: Add BatchNorm after convolutions
+        self.h_conv = nn.Sequential(
+            nn.Conv2d(2 * squeezed_dim, squeezed_dim, (1, 3), padding=(0, 1), padding_mode='replicate', bias=False),
+            nn.BatchNorm2d(squeezed_dim),
+            nn.SiLU(inplace=True)
+        )
+        self.w_conv = nn.Sequential(
+            nn.Conv2d(2 * squeezed_dim, squeezed_dim, (3, 1), padding=(1, 0), padding_mode='replicate', bias=False),
+            nn.BatchNorm2d(squeezed_dim),
+            nn.SiLU(inplace=True)
+        )
+ 
+        # ✅ 改进3: Learnable fusion weights for axial attention
+        self.fusion_weight = nn.Parameter(torch.ones(2) * 0.5)  # [h_weight, w_weight]
+        
+        # ✅ 改进4: Unsqueeze with activation and dropout
+        self.unsqueeze_proj = nn.Sequential(
+            nn.Conv2d(squeezed_dim, dim, 1, bias=False),
+            nn.BatchNorm2d(dim),
+            nn.Dropout2d(dropout) if dropout > 0 else nn.Identity()  # 更好的dropout位置
+        )
+        
+        # Context-aware global descriptor
+        self.global_context = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(dim, dim // 4, 1, bias=False),
+            nn.SiLU(inplace=True),  # 使用SiLU替代LeakyReLU
+            nn.Conv2d(dim // 4, dim, 1, bias=False),
+            nn.Sigmoid()
+        )
+ 
+    def forward(self, x):
+        H, W = x.shape[2:]
+        identity = x
+        
+        # Squeeze channel dimension
+        x_squeezed = self.squeeze_proj(x)
+        
+        # Height-wise attention
+        h_avg_features = self.h_avg_pool(x_squeezed)
+        h_max_features = self.h_max_pool(x_squeezed)
+        h_pooled_features = torch.cat((h_avg_features, h_max_features), dim=1)
+        h_attn = self.h_conv(h_pooled_features)
+        
+        # Width-wise attention
+        w_avg_features = self.w_avg_pool(x_squeezed)
+        w_max_features = self.w_max_pool(x_squeezed)
+        w_pooled_features = torch.cat((w_avg_features, w_max_features), dim=1)
+        w_attn = self.w_conv(w_pooled_features)
+        
+        # ✅ 改进5: Weighted fusion with broadcast instead of expand
+        weights = F.softmax(self.fusion_weight, dim=0)
+        attn = weights[0] * h_attn + weights[1] * w_attn  # 自动broadcast，无需expand
+        
+        # Restore channel dimension
+        out = self.unsqueeze_proj(attn)
+ 
+        # Context-aware modulation
+        context = self.global_context(identity)
+        out = out * context
+ 
+        return identity + out
  
  
 ######################################## IEEE Access terrasegnet by AI Little monster  end ########################################
