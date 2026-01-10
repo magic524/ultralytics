@@ -3,7 +3,26 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import List
- 
+import math
+
+# 假设 autopad 和 Conv 类已定义并可用
+
+class ECAAttention(nn.Module):
+    """Efficient Channel Attention module."""
+    def __init__(self, c, b=1, gamma=2):
+        super().__init__()
+        # 调整k值，使其与通道数c成比例
+        k_size = int(abs((math.log(c, 2) + b) / gamma))
+        k_size = k_size if k_size % 2 else k_size + 1 # 确保k_size为奇数
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        y = self.avg_pool(x) # 调整维度以适应Conv1d #这里的转置是冗余的，平均池化后H,W都是1
+        y = self.conv(y.squeeze(-1).transpose(-1, -2)).transpose(-1, -2).unsqueeze(-1)
+        y = self.sigmoid(y)
+        return x * y.expand_as(x)
      
 class SSAM(nn.Module):
     '''Spectral Spatial Attention Module (SSAM)'''
@@ -147,81 +166,79 @@ class CAAM(nn.Module):
 
 
 class CAAMv2(nn.Module):
-    """Convolutional Axial Attention Module v2 (small-object focused)."""
-
-    def __init__(self, dim, squeeze_factor=4, attn_kernel=5, local_kernel=3, dropout=0.05):
-        super().__init__()
+    '''Convolutional Axial Attention Module (CAAM)'''
+    def __init__(self, dim, squeeze_factor=4, dropout=0.1):
+        super(CAAMv2, self).__init__()
+        self.squeeze_factor = squeeze_factor
         squeezed_dim = max(1, dim // squeeze_factor)
-
-        # Channel squeeze with nonlinearity
+        
+        # Squeeze projections
         self.squeeze_proj = nn.Sequential(
             nn.Conv2d(dim, squeezed_dim, 1, bias=False),
-            nn.BatchNorm2d(squeezed_dim),
-            nn.SiLU(inplace=True),
+            nn.BatchNorm2d(squeezed_dim)
         )
-
-        # Axial pooling
+        self.unsqueeze_proj = nn.Sequential(
+            nn.Conv2d(squeezed_dim, dim, 1, bias=False), # Output dari attn (setelah h_conv/w_conv) adalah squeezed_dim
+            nn.BatchNorm2d(dim)
+        )
+        
+        # Axial attention components - Average Pooling
         self.h_avg_pool = nn.AdaptiveAvgPool2d((None, 1))
         self.w_avg_pool = nn.AdaptiveAvgPool2d((1, None))
+        
+        # Axial attention components - Max Pooling
         self.h_max_pool = nn.AdaptiveMaxPool2d((None, 1))
         self.w_max_pool = nn.AdaptiveMaxPool2d((1, None))
-
-        pad = attn_kernel // 2
-        self.h_conv = nn.Sequential(
-            nn.Conv2d(2 * squeezed_dim, squeezed_dim, (1, attn_kernel), padding=(0, pad), padding_mode="replicate", bias=False),
-            nn.BatchNorm2d(squeezed_dim),
-            nn.SiLU(inplace=True),
-        )
-        self.w_conv = nn.Sequential(
-            nn.Conv2d(2 * squeezed_dim, squeezed_dim, (attn_kernel, 1), padding=(pad, 0), padding_mode="replicate", bias=False),
-            nn.BatchNorm2d(squeezed_dim),
-            nn.SiLU(inplace=True),
-        )
-
-        # Local-detail branch helps small objects
-        lpad = local_kernel // 2
-        self.local_detail = nn.Sequential(
-            nn.Conv2d(squeezed_dim, squeezed_dim, local_kernel, padding=lpad, groups=squeezed_dim, bias=False),
-            nn.BatchNorm2d(squeezed_dim),
-            nn.Conv2d(squeezed_dim, squeezed_dim, 1, bias=False),
-            nn.BatchNorm2d(squeezed_dim),
-            nn.SiLU(inplace=True),
-        )
-
-        # Learnable fusion across height/width/local
-        self.fusion_logits = nn.Parameter(torch.tensor([0.0, 0.0, 0.5]))
-
-        self.unsqueeze_proj = nn.Sequential(
-            nn.Conv2d(squeezed_dim, dim, 1, bias=False),
-            nn.BatchNorm2d(dim),
-            nn.SiLU(inplace=True),
-            nn.Dropout2d(dropout) if dropout > 0 else nn.Identity(),
-        )
-
+        
+        self.h_conv = nn.Conv2d(2 * squeezed_dim, squeezed_dim, (1, 3), padding=(0, 1), padding_mode='replicate', bias=False) # groups default adalah 1
+        self.w_conv = nn.Conv2d(2 * squeezed_dim, squeezed_dim, (3, 1), padding=(1, 0), padding_mode='replicate', bias=False) # groups default adalah 1
+ 
+        # Context-aware global descriptor
         self.global_context = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(dim, dim // 4, 1, bias=False),
-            nn.SiLU(inplace=True),
+            nn.LeakyReLU(inplace=True),
             nn.Conv2d(dim // 4, dim, 1, bias=False),
-            nn.Sigmoid(),
+            nn.Sigmoid()
         )
-
+        
+        self.dropout = nn.Dropout(dropout)
+        self.eca = ECAAttention(dim)
+ 
     def forward(self, x):
+        H, W = x.shape[2:]
         identity = x
-        x_squeezed = self.squeeze_proj(x)
-
-        h_attn = self.h_conv(torch.cat((self.h_avg_pool(x_squeezed), self.h_max_pool(x_squeezed)), dim=1))
-        w_attn = self.w_conv(torch.cat((self.w_avg_pool(x_squeezed), self.w_max_pool(x_squeezed)), dim=1))
-        local = self.local_detail(x_squeezed)
-
-        weights = F.softmax(self.fusion_logits, dim=0)
-        fused = weights[0] * h_attn + weights[1] * w_attn + weights[2] * local
-
-        out = self.unsqueeze_proj(fused)
+        
+        # Squeeze channel dimension
+        x_squeezed = self.squeeze_proj(x) # [B, squeezed_dim, H, W]
+        
+        # Height-wise attention
+        h_avg_features = self.h_avg_pool(x_squeezed) # [B, squeezed_dim, H, 1]
+        h_max_features = self.h_max_pool(x_squeezed) # [B, squeezed_dim, H, 1]
+        # Concat at channel dim (dim=1)
+        h_pooled_features = torch.cat((h_avg_features, h_max_features), dim=1) # [B, 2 * squeezed_dim, H, 1]
+        
+        h_attn = self.h_conv(h_pooled_features) # Input: 2*squeezed_dim, Output: squeezed_dim. [B, squeezed_dim, H, 1]
+        h_attn = h_attn.expand(-1, -1, H, W)    # [B, squeezed_dim, H, W]
+        
+        # Width-wise attention
+        w_avg_features = self.w_avg_pool(x_squeezed) # [B, squeezed_dim, 1, W]
+        w_max_features = self.w_max_pool(x_squeezed) # [B, squeezed_dim, 1, W]
+        # Concat at channel dim
+        w_pooled_features = torch.cat((w_avg_features, w_max_features), dim=1) # [B, 2 * squeezed_dim, 1, W]
+ 
+        w_attn = self.w_conv(w_pooled_features) # Input: 2*squeezed_dim, Output: squeezed_dim. [B, squeezed_dim, 1, W]
+        w_attn = w_attn.expand(-1, -1, H, W)    # [B, squeezed_dim, H, W]
+        
+        # Combine axial attentions
+        attn = h_attn * w_attn  ### ###################################
+        attn = self.dropout(attn)
+        
+        # Restore channel dimension
+        out = self.unsqueeze_proj(attn)
+ 
+        # Context-aware modulation
         context = self.global_context(identity)
-        out = out * (1 + context)  # boost rather than only gate
-
-        return identity + out
+        out = out * context 
  
- 
-######################################## IEEE Access terrasegnet by AI Little monster  end ########################################
+        return self.eca(identity + out)
